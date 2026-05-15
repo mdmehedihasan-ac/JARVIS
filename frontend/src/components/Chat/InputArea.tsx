@@ -1,376 +1,270 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
-import { Send, Square, Paperclip } from 'lucide-react';
-import { useAppStore, generateId } from '../../lib/store';
-import { streamChat } from '../../lib/sse';
-import { fetchSavings, getBase } from '../../lib/api';
-import { MicButton } from './MicButton';
-import { useSpeech } from '../../hooks/useSpeech';
-import type { ChatMessage, ToolCallInfo, TokenUsage, MessageTelemetry } from '../../types';
+import { useEffect, useRef, useState } from 'react';
+import { useApp } from '../../lib/store';
+import { api, openChatWs, type WsChatEvent } from '../../lib/api';
+
+const SLASH_CMDS: { cmd: string; desc: string; expand?: string }[] = [
+  { cmd: '/swarm', desc: 'Avvia swarm multi-agente' },
+  { cmd: '/learn', desc: 'Apprendi da internet', expand: 'avvia apprendimento automatico su ' },
+  { cmd: '/queue', desc: 'Aggiungi topic alla coda', expand: 'impara su ' },
+  { cmd: '/web', desc: 'Comando browser', expand: 'webbridge ' },
+  { cmd: '/skill', desc: 'Crea skill', expand: 'crea skill ' },
+  { cmd: '/stop', desc: 'Ferma apprendimento', expand: 'ferma apprendimento' },
+  { cmd: '/status', desc: 'Stato apprendimento', expand: 'stato apprendimento' },
+  { cmd: '/clear', desc: 'Pulisci chat' },
+  { cmd: '/export', desc: 'Esporta conversazione' },
+  { cmd: '/new', desc: 'Nuova sessione' },
+];
 
 export function InputArea() {
-  const [input, setInput] = useState('');
+  const [value, setValue] = useState('');
+  const [showSlash, setShowSlash] = useState(false);
+  const [slashFilter, setSlashFilter] = useState('');
+  const wsRef = useRef<WebSocket | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const abortRef = useRef<AbortController | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const activeId = useAppStore((s) => s.activeId);
-  const selectedModel = useAppStore((s) => s.selectedModel);
-  const streamState = useAppStore((s) => s.streamState);
-  const messages = useAppStore((s) => s.messages);
-  const speechEnabled = useAppStore((s) => s.settings.speechEnabled);
-  const maxTokens = useAppStore((s) => s.settings.maxTokens);
-  const temperature = useAppStore((s) => s.settings.temperature);
-  const createConversation = useAppStore((s) => s.createConversation);
-  const addMessage = useAppStore((s) => s.addMessage);
-  const updateLastAssistant = useAppStore((s) => s.updateLastAssistant);
-  const setStreamState = useAppStore((s) => s.setStreamState);
-  const resetStream = useAppStore((s) => s.resetStream);
-  const modelLoading = useAppStore((s) => s.modelLoading);
-
-  const { state: speechState, available: speechAvailable, startRecording, stopRecording } = useSpeech();
-
-  // Abort in-flight stream when the user switches models mid-generation.
-  // This prevents errors from trying to continue a stream with a stale model.
-  const prevModelRef = useRef(selectedModel);
-  useEffect(() => {
-    if (prevModelRef.current !== selectedModel && streamState.isStreaming) {
-      abortRef.current?.abort();
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-      resetStream();
-      abortRef.current = null;
-    }
-    prevModelRef.current = selectedModel;
-  }, [selectedModel, streamState.isStreaming, resetStream]);
-
-  const micDisabled = !speechEnabled || !speechAvailable || streamState.isStreaming;
-  const micReason: 'not-enabled' | 'no-backend' | 'streaming' | undefined =
-    !speechEnabled ? 'not-enabled'
-    : !speechAvailable ? 'no-backend'
-    : streamState.isStreaming ? 'streaming'
-    : undefined;
-
-  const handleMicClick = useCallback(async () => {
-    if (speechState === 'recording') {
-      try {
-        const text = await stopRecording();
-        if (text) {
-          setInput((prev) => (prev ? prev + ' ' + text : text));
-        }
-      } catch {
-        // Error is captured in useSpeech
-      }
-    } else {
-      await startRecording();
-    }
-  }, [speechState, startRecording, stopRecording]);
+  const streaming = useApp((s) => s.streaming);
+  const currentMsgId = useApp((s) => s.currentMsgId);
+  const messages = useApp((s) => s.messages);
+  const pushMessage = useApp((s) => s.pushMessage);
+  const appendStream = useApp((s) => s.appendStream);
+  const startStream = useApp((s) => s.startStream);
+  const finishStream = useApp((s) => s.finishStream);
+  const clearChat = useApp((s) => s.clearChat);
+  const newSession = useApp((s) => s.newSession);
+  const exportChat = useApp((s) => s.exportChat);
 
   useEffect(() => {
+    function onSuggest(ev: Event) {
+      const detail = (ev as CustomEvent<string>).detail;
+      if (typeof detail === 'string') send(detail);
+    }
+    window.addEventListener('jarvis:suggest', onSuggest);
+    return () => window.removeEventListener('jarvis:suggest', onSuggest);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault();
+        textareaRef.current?.focus();
+      }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'e') {
+        e.preventDefault();
+        doExport();
+      }
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'n') {
+        e.preventDefault();
+        newSession();
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function autosize() {
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = 'auto';
-    el.style.height = Math.min(el.scrollHeight, 200) + 'px';
-  }, [input]);
+    el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
+  }
 
-  const stopStreaming = useCallback(() => {
-    abortRef.current?.abort();
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
+  function doExport() {
+    const txt = exportChat();
+    if (!txt) return;
+    const blob = new Blob([txt], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `jarvis_chat_${Date.now()}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function handleSlashCmd(cmd: string): boolean {
+    const entry = SLASH_CMDS.find((c) => c.cmd === cmd);
+    if (!entry) return false;
+    if (cmd === '/clear') { clearChat(); setValue(''); return true; }
+    if (cmd === '/export') { doExport(); setValue(''); return true; }
+    if (cmd === '/new') { newSession(); setValue(''); return true; }
+    if (entry.expand !== undefined) {
+      setValue(entry.expand);
+      setShowSlash(false);
+      textareaRef.current?.focus();
+      return true;
     }
-    resetStream();
-  }, [resetStream]);
+    const prefer = cmd.replace('/', '');
+    const msgText = cmd === '/swarm'
+      ? (value.replace('/swarm', '').trim() || 'swarm task')
+      : value.trim();
+    send(msgText, undefined, prefer);
+    return true;
+  }
 
-  const sendMessage = useCallback(async () => {
-    const content = input.trim();
-    if (!content || streamState.isStreaming) return;
+  function send(text?: string, _evt?: unknown, prefer?: string) {
+    const msg = (text ?? value).trim();
+    if (!msg || streaming) return;
 
-    setInput('');
-
-    let convId = activeId;
-    if (!convId) {
-      convId = createConversation(selectedModel);
+    if (msg.startsWith('/')) {
+      const parts = msg.split(' ');
+      const handled = handleSlashCmd(parts[0]);
+      if (handled && !SLASH_CMDS.find((c) => c.cmd === parts[0])?.expand) return;
     }
 
-    const userMsg: ChatMessage = {
-      id: generateId(),
-      role: 'user',
-      content,
-      timestamp: Date.now(),
+    const msgId = `msg_${Date.now()}`;
+    pushMessage({ role: 'user', content: msg });
+    setValue('');
+    setShowSlash(false);
+    if (textareaRef.current) textareaRef.current.style.height = 'auto';
+
+    startStream(msgId);
+    const ws = openChatWs();
+    wsRef.current = ws;
+    let accumulated = '';
+    let opened = false;
+    let settled = false;
+    let responseStarted = false;
+    const fallbackTimer = window.setTimeout(() => {
+      if (!opened && !settled) {
+        ws.close();
+        void sendRestFallback(msg, prefer);
+      }
+    }, 2500);
+    const responseTimer = window.setTimeout(() => {
+      if (opened && !responseStarted && !settled) {
+        settled = true;
+        ws.close();
+        void sendRestFallback(msg, prefer);
+      }
+    }, 12000);
+    ws.onopen = () => {
+      opened = true;
+      window.clearTimeout(fallbackTimer);
+      ws.send(JSON.stringify({
+        message: prefer ? msg : msg,
+        history: messages.map((m) => ({ role: m.role, content: m.content })),
+        prefer,
+        speak: false,
+      }));
     };
-    addMessage(convId, userMsg);
-
-    // Build API messages before adding assistant placeholder
-    const currentMessages = useAppStore.getState().messages;
-    const apiMessages = currentMessages.map((m) => ({
-      role: m.role,
-      content: m.content,
-    }));
-
-    const assistantMsg: ChatMessage = {
-      id: generateId(),
-      role: 'assistant',
-      content: '',
-      timestamp: Date.now(),
-    };
-    addMessage(convId, assistantMsg);
-
-    // Start streaming
-    const startTime = Date.now();
-    const timer = setInterval(() => {
-      setStreamState({ elapsedMs: Date.now() - startTime });
-    }, 100);
-    timerRef.current = timer;
-
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    let accumulatedContent = '';
-    let usage: TokenUsage | undefined;
-    let complexity: { score: number; tier: string; suggested_max_tokens: number } | undefined;
-    const toolCalls: ToolCallInfo[] = [];
-    let lastFlush = 0;
-    let ttftMs: number | undefined;
-
-    setStreamState({
-      isStreaming: true,
-      phase: 'Generating...',
-      elapsedMs: 0,
-      activeToolCalls: [],
-      content: '',
-    });
-    useAppStore.getState().addLogEntry({
-      timestamp: Date.now(),
-      level: 'info',
-      category: 'chat',
-      message: `Request: "${content.slice(0, 80)}${content.length > 80 ? '...' : ''}" → ${selectedModel}`,
-    });
-
-    try {
-      for await (const sseEvent of streamChat(
-        { model: selectedModel, messages: apiMessages, stream: true, temperature, max_tokens: maxTokens },
-        controller.signal,
-      )) {
-        const eventName = sseEvent.event;
-
-        if (eventName === 'agent_turn_start') {
-          setStreamState({ phase: 'Agent thinking...' });
-        } else if (eventName === 'inference_start') {
-          setStreamState({ phase: 'Generating...' });
-          useAppStore.getState().addLogEntry({
-            timestamp: Date.now(), level: 'info', category: 'chat',
-            message: `Generating with ${selectedModel}...`,
-          });
-        } else if (eventName === 'tool_call_start') {
-          try {
-            const data = JSON.parse(sseEvent.data);
-            const tc: ToolCallInfo = {
-              id: generateId(),
-              tool: data.tool,
-              arguments: data.arguments || '',
-              status: 'running',
-            };
-            toolCalls.push(tc);
-            setStreamState({
-              phase: `Calling ${data.tool}...`,
-              activeToolCalls: [...toolCalls],
-            });
-            updateLastAssistant(convId, accumulatedContent, [...toolCalls]);
-            useAppStore.getState().addLogEntry({
-              timestamp: Date.now(), level: 'info', category: 'tool',
-              message: `Calling ${data.tool}(${data.arguments || ''})`,
-            });
-          } catch {}
-        } else if (eventName === 'tool_call_end') {
-          try {
-            const data = JSON.parse(sseEvent.data);
-            const tc = toolCalls.find(
-              (t) => t.tool === data.tool && t.status === 'running',
-            );
-            if (tc) {
-              tc.status = data.success ? 'success' : 'error';
-              tc.latency = data.latency;
-              tc.result = data.result;
-            }
-            setStreamState({
-              phase: 'Generating...',
-              activeToolCalls: [...toolCalls],
-            });
-            updateLastAssistant(convId, accumulatedContent, [...toolCalls]);
-          } catch {}
-        } else {
-          try {
-            const data = JSON.parse(sseEvent.data);
-            const delta = data.choices?.[0]?.delta;
-            if (data.usage) usage = data.usage;
-            if (data.complexity) complexity = data.complexity;
-            if (delta?.content) {
-              if (!ttftMs) ttftMs = Date.now() - startTime;
-              accumulatedContent += delta.content;
-              setStreamState({ content: accumulatedContent, phase: '' });
-
-              const now = Date.now();
-              if (now - lastFlush >= 80) {
-                updateLastAssistant(
-                  convId,
-                  accumulatedContent,
-                  toolCalls.length > 0 ? [...toolCalls] : undefined,
-                );
-                lastFlush = now;
-              }
-            }
-            if (data.choices?.[0]?.finish_reason === 'stop') break;
-          } catch {}
-        }
-      }
-    } catch (err: any) {
-      if (err.name === 'AbortError') {
-        // User cancelled or model switch — keep whatever was accumulated
-        if (!accumulatedContent) accumulatedContent = '(Generation stopped)';
-      } else {
-        const errMsg = err?.message || String(err);
-        accumulatedContent =
-          accumulatedContent || `Error: ${errMsg}`;
-        useAppStore.getState().addLogEntry({
-          timestamp: Date.now(), level: 'error', category: 'chat',
-          message: `Stream error: ${errMsg}`,
-        });
-      }
-    } finally {
-      if (!accumulatedContent) {
-        accumulatedContent = 'No response was generated. Please try again.';
-      }
-      const totalMs = Date.now() - startTime;
-      const _CLOUD_PREFIXES = ['gpt-', 'o1-', 'o3-', 'o4-', 'claude-', 'gemini-', 'openrouter/', 'MiniMax-', 'chatgpt-'];
-      const engineLabel = _CLOUD_PREFIXES.some(p => selectedModel.startsWith(p)) ? 'cloud' : 'ollama';
-      const telemetry: MessageTelemetry = {
-        engine: engineLabel,
-        model_id: selectedModel,
-        total_ms: totalMs,
-        ttft_ms: ttftMs,
-        tokens_per_sec: usage?.completion_tokens
-          ? usage.completion_tokens / (totalMs / 1000)
-          : undefined,
-        complexity_score: complexity?.score,
-        complexity_tier: complexity?.tier,
-        suggested_max_tokens: complexity?.suggested_max_tokens,
-      };
-      // Check if the response has digest audio available
-      let audioMeta: { url: string } | undefined;
+    ws.onmessage = (ev) => {
       try {
-        const digestRes = await fetch(`${getBase()}/api/digest`);
-        if (digestRes.ok) {
-          const digest = await digestRes.json();
-          if (digest.audio_available) {
-            audioMeta = { url: `${getBase()}/api/digest/audio` };
-          }
+        const data: WsChatEvent = JSON.parse(ev.data);
+        if (data.type === 'token') {
+          responseStarted = true;
+          accumulated += data.token;
+          appendStream(data.token);
+        } else if (data.type === 'done') {
+          settled = true;
+          window.clearTimeout(responseTimer);
+          finishStream(data.text || accumulated);
+          ws.close();
+        } else if (data.type === 'error') {
+          settled = true;
+          window.clearTimeout(responseTimer);
+          appendStream(`\n\n[ERR] ${data.error}`);
+          finishStream();
+          ws.close();
         }
-      } catch {
-        // Not a digest response or server unavailable — skip
+      } catch { /* ignore */ }
+    };
+    ws.onerror = () => {
+      if (!settled) {
+        settled = true;
+        window.clearTimeout(fallbackTimer);
+        window.clearTimeout(responseTimer);
+        void sendRestFallback(msg, prefer);
       }
+    };
+    ws.onclose = () => {
+      wsRef.current = null;
+      window.clearTimeout(fallbackTimer);
+      window.clearTimeout(responseTimer);
+    };
+  }
 
-      updateLastAssistant(
-        convId,
-        accumulatedContent,
-        toolCalls.length > 0 ? toolCalls : undefined,
-        usage,
-        telemetry,
-        audioMeta,
-      );
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-      resetStream();
-      useAppStore.getState().addLogEntry({
-        timestamp: Date.now(), level: 'info', category: 'chat',
-        message: `Response: ${accumulatedContent.length} chars`,
-      });
-      abortRef.current = null;
-
-      fetchSavings()
-        .then((data) => useAppStore.getState().setSavings(data))
-        .catch(() => {});
+  async function sendRestFallback(msg: string, prefer?: string) {
+    try {
+      const resp = await api.chat(msg, messages.map((m) => ({ role: m.role, content: m.content })), prefer, false);
+      finishStream(resp.text);
+    } catch {
+      appendStream('\n\n[ERR] CONNESSIONE BACKEND FALLITA');
+      finishStream();
     }
-  }, [
-    input,
-    activeId,
-    selectedModel,
-    streamState.isStreaming,
-    createConversation,
-    addMessage,
-    updateLastAssistant,
-    setStreamState,
-    resetStream,
-  ]);
+  }
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
+  async function stop() {
+    if (currentMsgId) {
+      try { await api.cancel(currentMsgId); } catch { /* ignore */ }
+    }
+    wsRef.current?.close();
+    finishStream();
+  }
+
+  function onKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === 'Escape') { setShowSlash(false); return; }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      sendMessage();
+      if (showSlash) {
+        const filtered = SLASH_CMDS.filter((c) => c.cmd.startsWith(slashFilter));
+        if (filtered.length > 0) { handleSlashCmd(filtered[0].cmd); return; }
+      }
+      send();
     }
-  };
+  }
+
+  function onChangeValue(v: string) {
+    setValue(v);
+    autosize();
+    if (v.startsWith('/') && !v.includes(' ')) {
+      setSlashFilter(v);
+      setShowSlash(true);
+    } else {
+      setShowSlash(false);
+    }
+  }
+
+  const filteredCmds = SLASH_CMDS.filter((c) => c.cmd.startsWith(slashFilter));
 
   return (
-    <div className="px-4 pb-4 pt-2" style={{ maxWidth: 'var(--chat-max-width)', margin: '0 auto', width: '100%' }}>
-      <div
-        className="flex items-center gap-2 rounded-2xl px-4 py-3 transition-shadow"
-        style={{
-          background: 'var(--color-input-bg)',
-          border: '1px solid var(--color-input-border)',
-          boxShadow: 'var(--shadow-sm)',
-        }}
-      >
-        <textarea
-          ref={textareaRef}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Message OpenJarvis..."
-          rows={1}
-          className="flex-1 bg-transparent outline-none resize-none text-sm leading-relaxed"
-          style={{ color: 'var(--color-text)', maxHeight: '200px' }}
-          disabled={streamState.isStreaming || modelLoading}
-        />
-        {streamState.isStreaming ? (
-          <button
-            onClick={stopStreaming}
-            className="p-2 rounded-xl transition-colors shrink-0 cursor-pointer"
-            style={{ background: 'var(--color-error)', color: 'var(--color-on-accent)' }}
-            title="Stop generating"
-          >
-            <Square size={16} />
-          </button>
-        ) : (
-          <div className="flex items-center gap-1">
-            <MicButton
-              state={speechState}
-              onClick={handleMicClick}
-              disabled={micDisabled}
-              reason={micReason}
-            />
-            <button
-              onClick={sendMessage}
-              disabled={!input.trim() || modelLoading}
-              className="p-2 rounded-xl transition-colors shrink-0 cursor-pointer disabled:opacity-30 disabled:cursor-default"
-              style={{
-                background: input.trim() ? 'var(--color-accent)' : 'var(--color-bg-tertiary)',
-                color: input.trim() ? 'white' : 'var(--color-text-tertiary)',
-              }}
-              title="Send message"
-            >
-              <Send size={16} />
-            </button>
+    <div className="shrink-0 pb-2">
+      <div className="max-w-2xl mx-auto px-4 relative">
+        {showSlash && filteredCmds.length > 0 && (
+          <div className="absolute bottom-full mb-1 left-4 right-4 bg-[#001a2a]/95 border border-[#00d4ff]/20 backdrop-blur-sm z-50">
+            {filteredCmds.map((c) => (
+              <button
+                key={c.cmd}
+                onClick={() => handleSlashCmd(c.cmd)}
+                className="w-full text-left px-3 py-1.5 hover:bg-[#00d4ff]/10 flex gap-3 items-center"
+              >
+                <span className="text-[11px] font-mono text-[#00d4ff]">{c.cmd}</span>
+                <span className="text-[10px] font-mono text-[#00d4ff]/40">{c.desc}</span>
+              </button>
+            ))}
           </div>
         )}
-      </div>
-      <div className="flex items-center justify-center mt-2 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
-        <span>
-          <kbd className="font-mono">Enter</kbd> to send &middot;{' '}
-          <kbd className="font-mono">Shift+Enter</kbd> for new line
-        </span>
+        <div className="flex items-end gap-2 hud-input px-3 py-2 bg-[#001a2a]/45 backdrop-blur-sm">
+          <textarea
+            ref={textareaRef}
+            value={value}
+            placeholder={streaming ? 'JARVIS PROCESSING...' : 'ENTER COMMAND · / FOR SHORTCUTS'}
+            disabled={streaming}
+            onChange={(e) => onChangeValue(e.target.value)}
+            onKeyDown={onKey}
+            rows={1}
+            className="flex-1 bg-transparent resize-none outline-none text-[12px] text-[#00d4ff]/80 placeholder:text-[#00d4ff]/20 disabled:opacity-40 font-mono"
+          />
+          <button
+            onClick={() => (streaming ? void stop() : send())}
+            disabled={!streaming && !value.trim()}
+            className="px-3 py-1.5 text-[9px] font-mono tracking-wider border border-[#00d4ff]/30 text-[#00d4ff] hover:bg-[#00d4ff]/10 transition disabled:opacity-30 disabled:cursor-not-allowed"
+          >
+            {streaming ? 'ABORT' : 'TRANSMIT'}
+          </button>
+        </div>
+        <p className="mt-1 text-[8px] font-mono text-[#00d4ff]/20 text-center tracking-wider">
+          ENTER · SHIFT+ENTER NEW LINE · / COMANDI · ⌘K FOCUS · ⌘⇧E EXPORT · ⌘⇧N NUOVA SESSIONE
+        </p>
       </div>
     </div>
   );
